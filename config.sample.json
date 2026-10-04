@@ -1,0 +1,12 @@
+{
+  "title": "窓の外カメラ",
+  "port": 8787,
+  "admin_port": 8788,
+  "interval_sec": 60,
+  "size": 640,
+  "pixelate": 8,
+  "source": "dshow",
+  "device": "ここに --list-cameras で出たカメラの名前",
+  "ffmpeg": "ffmpeg",
+  "shutter_file": "shutter"
+}

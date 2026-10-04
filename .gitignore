@@ -1,0 +1,15 @@
+config.json
+shutter
+__pycache__/
+
+# PMO管理ディレクトリ（非公開）
+pmo/
+
+# 設定ファイル（非公開）
+config/
+
+# ユーザーデータ（非公開）
+data/
+
+# macOS
+.DS_Store
