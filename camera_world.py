@@ -2,6 +2,7 @@
 
 公開用サーバー(トンネルに渡す)と管理用サーバー(127.0.0.1 だけ)の2つを立て、
 撮影ループが interval_sec ごとに ffmpeg で1枚撮ってメモリ上の画像を差し替える。
+自動撮影を止めて、管理画面の「今すぐ更新」でだけ撮ることもできる。
 Python 標準ライブラリと ffmpeg(外部コマンド)だけで動く。
 """
 import argparse
@@ -10,6 +11,7 @@ import hashlib
 import html
 import itertools
 import json
+import math
 import os
 import subprocess
 import sys
@@ -41,6 +43,7 @@ DEFAULT_CONFIG = {
     "port": 8787,
     "admin_port": 8788,
     "interval_sec": 60,
+    "auto_capture": True,
     "size": 640,
     "pixelate": 8,
     "source": "dshow",
@@ -124,6 +127,8 @@ class Camera:
         self.captured_at = None
         self.admin_paused = False
         self.pixelate = max(1, int(config["pixelate"]))  # 管理画面から変えられる。再起動すると設定の値に戻る
+        self.auto = bool(config["auto_capture"])  # 同上。False なら手動の更新でだけ撮る
+        # 手動だけのときは math.inf。ただし起動直後と再開直後は 0 にして、手動だけでも1枚撮る(古い画像を出し続けないように)
         self.next_capture_at = 0.0
         self.messages = collections.deque(maxlen=MESSAGES_MAX)
         self.message_ids = itertools.count(1)
@@ -131,7 +136,10 @@ class Camera:
         self.post("⏸ 一時停止中です" if self.was_paused else self.start_message())
 
     def start_message(self):
-        return f"📷 配信を開始しました({self.config['interval_sec']}秒ごとに更新)"
+        return f"📷 配信を開始しました({self.update_text()})"
+
+    def update_text(self):
+        return f"{self.config['interval_sec']}秒ごとに更新" if self.auto else "ときどき手動で更新"
 
     def paused(self):
         return self.admin_paused or self.shutter_path.exists()
@@ -160,6 +168,13 @@ class Camera:
         self.admin_paused = paused
         self.sync_paused()
 
+    def set_auto(self, auto):
+        if auto == self.auto:
+            return
+        self.auto = auto
+        self.next_capture_at = 0.0 if auto else math.inf  # 自動に戻したらすぐ撮る
+        self.post(f"🔁 自動更新にしました({self.update_text()})" if auto else f"✋ 自動更新を止めました({self.update_text()})")
+
     # 段階を1つ動かして、すぐ撮り直す(粗くしたときに、細かい画像を公開し続けないように)
     def step_pixelate(self, coarser):
         if coarser:
@@ -185,7 +200,7 @@ class Camera:
                     self.image, self.captured_at = image, time.time()
                 ok = True
             # 自動撮影のタイマーは最後に撮った時刻から数え直す(手動更新の直後に自動撮影が重ならない)
-            self.next_capture_at = time.time() + self.config["interval_sec"]
+            self.next_capture_at = time.time() + self.config["interval_sec"] if self.auto else math.inf
             return ok
 
     def run(self):
@@ -218,7 +233,7 @@ class Camera:
                     "image": image,
                     "paused": paused,
                     "capturedAt": self.captured_at,
-                    "intervalSec": cfg["interval_sec"],
+                    "intervalSec": cfg["interval_sec"] if self.auto else None,  # 手動で更新するときは null
                     "size": [self.image["side"]] * 2 if self.image else None,
                 },
                 "messages": list(self.messages),
@@ -301,6 +316,7 @@ small {{ color: #9aa3bb; }}
 <div>
 <form method="post" action="/{toggle}"><button>{toggle_label}</button></form>
 <form method="post" action="/capture"><button {capture_disabled}>📸 今すぐ更新</button></form>
+<form method="post" action="/{auto_toggle}"><button>{auto_label}</button></form>
 </div>
 <div class="mosaic">モザイク: <b>{mosaic}</b>
 <form method="post" action="/mosaic/finer"><button {finer_disabled}>➖ 細かく</button></form>
@@ -370,6 +386,10 @@ def admin_handler(camera):
                 camera.set_admin_paused(True)
             elif path == "/resume":
                 camera.set_admin_paused(False)
+            elif path == "/auto/on":
+                camera.set_auto(True)
+            elif path == "/auto/off":
+                camera.set_auto(False)
             elif path == "/capture":
                 camera.capture()  # 撮り終わるまで待ってから画面に戻す
             elif path == "/mosaic/finer":
@@ -388,14 +408,23 @@ def admin_handler(camera):
                 state = "⏸ 一時停止中"
             else:
                 state = "🔴 配信中"
-            next_sec = None if paused else max(0, round(camera.next_capture_at - time.time()))
+            if paused:
+                next_sec, next_text = None, "一時停止中は撮影しません"
+            elif camera.next_capture_at == math.inf:
+                next_sec, next_text = None, "自動撮影は止めています(「今すぐ更新」で撮ります)"
+            else:
+                next_sec = max(0, round(camera.next_capture_at - time.time()))
+                next_text = f"次の自動撮影まで {next_sec} 秒"
             n = camera.pixelate
             image = camera.image
             if image:
                 # 目安: 撮るたびに、つないでいるもくもく会1つにつき1回送る
-                per_hour = len(image["data"]) * 3600 / camera.config["interval_sec"]
-                image_info = (f"{image['side']}x{image['side']} / {format_bytes(len(image['data']))}"
-                              f"(もくもく会1つにつき 約 {format_bytes(per_hour)}/時)")
+                image_info = f"{image['side']}x{image['side']} / {format_bytes(len(image['data']))}"
+                if camera.auto:
+                    per_hour = len(image["data"]) * 3600 / camera.config["interval_sec"]
+                    image_info += f"(もくもく会1つにつき 約 {format_bytes(per_hour)}/時)"
+                else:
+                    image_info += "(撮るたびに、もくもく会1つにつき1回送ります)"
             else:
                 image_info = "まだありません"
             captured = time.strftime("%H:%M:%S", time.localtime(camera.captured_at)) if camera.captured_at else "まだありません"
@@ -404,12 +433,14 @@ def admin_handler(camera):
                 state=state,
                 captured=captured,
                 image_info=image_info,
-                next_text="一時停止中は撮影しません" if next_sec is None else f"次の自動撮影まで {next_sec} 秒",
+                next_text=next_text,
                 next_sec="null" if next_sec is None else next_sec,
                 stamp=int(time.time()),
                 toggle="resume" if camera.admin_paused else "pause",
                 toggle_label="▶ 再開" if camera.admin_paused else "⏸ 一時停止",
                 capture_disabled="disabled" if paused else "",
+                auto_toggle="auto/off" if camera.auto else "auto/on",
+                auto_label="✋ 自動更新を止める" if camera.auto else "🔁 自動更新にする",
                 shutter=html.escape(str(camera.shutter_path)),
                 mosaic="なし" if n == 1 else f"{n}(一辺 {camera.config['size'] // n} ドット)",
                 finer_disabled="disabled" if n <= PIXELATE_LEVELS[0] else "",
